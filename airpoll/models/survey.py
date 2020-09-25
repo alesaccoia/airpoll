@@ -3,7 +3,7 @@ from django.utils.translation import gettext_lazy as _
 from django.utils.text import slugify
 from django.core.exceptions import ValidationError
 
-from . import Client
+from . import Client, Interviewee, Interviewer
 
 
 CHOICES_HELP_TEXT = _(
@@ -17,6 +17,7 @@ class Survey(models.Model):
     referent = models.ForeignKey(Client, on_delete=models.CASCADE)
     name = models.CharField(_("Name"), max_length=400)
     description = models.TextField(_("Description"))
+    brief = models.FileField(upload_to='uploads/', null=True)
 
     class SurveyStatus(models.TextChoices):
         DRAFT = 'DR', _('Draft')
@@ -119,3 +120,86 @@ class Question(models.Model):
             msg += "(*) "
         msg += "{}".format(self.get_clean_choices())
         return msg
+
+
+class Response(models.Model):
+
+    """
+        A Response object is a collection of questions and answers with a
+        unique interview uuid.
+    """
+
+    created = models.DateTimeField(_("Creation date"), auto_now_add=True)
+    updated = models.DateTimeField(_("Update date"), auto_now=True)
+    survey = models.ForeignKey(Survey, on_delete=models.CASCADE, verbose_name=_("Survey"), related_name="responses")
+    user = models.ForeignKey(Interviewee, on_delete=models.SET_NULL, verbose_name=_("User"), null=True, blank=True)
+    interviewer = models.ForeignKey(Interviewer, on_delete=models.SET_NULL, verbose_name=_("Interviewer"), null=True, blank=True)
+    interview_uuid = models.CharField(_("Interview unique identifier"), max_length=36)
+
+    class Meta:
+        verbose_name = _("Set of answers to surveys")
+        verbose_name_plural = _("Sets of answers to surveys")
+
+    def __str__(self):
+        msg = "Response to {} by {}".format(self.survey, self.user)
+        msg += " on {}".format(self.created)
+        return msg
+
+
+class Answer(models.Model):
+
+    question = models.ForeignKey(Question, on_delete=models.CASCADE, verbose_name=_("Question"), related_name="answers")
+    response = models.ForeignKey(Response, on_delete=models.CASCADE, verbose_name=_("Response"), related_name="answers")
+    created = models.DateTimeField(_("Creation date"), auto_now_add=True)
+    updated = models.DateTimeField(_("Update date"), auto_now=True)
+    body = models.TextField(_("Content"), blank=True, null=True)
+
+    def __init__(self, *args, **kwargs):
+        try:
+            question = Question.objects.get(pk=kwargs["question_id"])
+        except KeyError:
+            question = kwargs.get("question")
+        body = kwargs.get("body")
+        if question and body:
+            self.check_answer_body(question, body)
+        super(Answer, self).__init__(*args, **kwargs)
+
+    @property
+    def values(self):
+        if self.body is None:
+            return [None]
+        if len(self.body) < 3 or self.body[0:3] != "[u'":
+            return [self.body]
+        #  We do not use eval for security reason but it could work with :
+        #  eval(self.body)
+        #  It would permit to inject code into answer though.
+        values = []
+        raw_values = self.body.split("', u'")
+        nb_values = len(raw_values)
+        for i, value in enumerate(raw_values):
+            if i == 0:
+                value = value[3:]
+            if i + 1 == nb_values:
+                value = value[:-2]
+            values.append(value)
+        return values
+
+    def check_answer_body(self, question, body):
+        if question.type in [Question.RADIO, Question.SELECT, Question.SELECT_MULTIPLE]:
+            choices = question.get_clean_choices()
+            if body:
+                if body[0] == "[":
+                    answers = []
+                    for i, part in enumerate(body.split("'")):
+                        if i % 2 == 1:
+                            answers.append(part)
+                else:
+                    answers = [body]
+            for answer in answers:
+                if answer not in choices:
+                    msg = "Impossible answer '{}'".format(body)
+                    msg += " should be in {} ".format(choices)
+                    raise ValidationError(msg)
+
+    def __str__(self):
+        return "{} to '{}' : '{}'".format(self.__class__.__name__, self.question, self.body)
